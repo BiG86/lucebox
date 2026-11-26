@@ -592,6 +592,14 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
         (std::getenv("LUCE_INKLING2_WAVEFRONT_PREFILL") == nullptr ||
          std::atoi(std::getenv("LUCE_INKLING2_WAVEFRONT_PREFILL")) != 0);
     if (use_wavefront) {
+        if (std::any_of(weights_.layers.begin(), weights_.layers.end(), [](const Inkling2Layer & layer) {
+                return layer.ffn_gate_up_exps_scale || layer.ffn_down_exps_scale;
+            })) {
+            result.fail(GenerateErrorCode::PrefillFailed,
+                "inkling2 wavefront prefill does not support per-expert scales; "
+                "set LUCE_INKLING2_WAVEFRONT_PREFILL=0 for chunked prefill");
+            return result;
+        }
         Inkling2ForwardOut r = inkling2_prefill_wavefront(
             backend_, weights_, cache_, req.prompt.data() + pos, rem_pre, pos, wf_chunk,
             /*need_logits=*/!is_greedy, /*capture_taps=*/weights_.dspark.loaded);

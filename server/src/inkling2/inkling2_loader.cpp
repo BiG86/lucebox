@@ -187,8 +187,34 @@ bool load_inkling2_gguf(const std::string & path,
         }
     }
 
-    // Allocate all raw GGUF tensors on target_backend (fits easily in 32 GB R9700: ~17.6 GB for IQ4_NL!)
     out.ctx = meta;
+    out.layers.resize(out.n_layer_phys);
+    for (int i = 0; i < out.n_layer_phys; ++i) {
+        auto & layer = out.layers[i];
+        const std::string prefix = "blk." + std::to_string(i) + ".";
+        auto bind_scale = [&](const char * suffix, ggml_tensor * & scale) {
+            const std::string name = prefix + suffix;
+            scale = ggml_get_tensor(meta, name.c_str());
+            if (!scale) return true;
+            if (scale->type != GGML_TYPE_F32 || !ggml_is_vector(scale) || scale->ne[0] != out.n_expert) {
+                error = "inkling2_loader: expected F32[" + std::to_string(out.n_expert) + "] for " + name;
+                return false;
+            }
+            if (expert_backend) {
+                error = "inkling2_loader: dual-GPU execution does not support per-expert scales (" + name + ")";
+                return false;
+            }
+            return true;
+        };
+        if (!bind_scale("ffn_gate_up_exps.scale", layer.ffn_gate_up_exps_scale) ||
+            !bind_scale("ffn_down_exps.scale", layer.ffn_down_exps_scale)) {
+            gguf_free(g);
+            free_inkling2_weights(out);
+            return false;
+        }
+    }
+
+    // Allocate all raw GGUF tensors on target_backend (fits easily in 32 GB R9700: ~17.6 GB for IQ4_NL!)
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, target_backend);
     if (!out.buf) {
         gguf_free(g);
@@ -249,7 +275,6 @@ bool load_inkling2_gguf(const std::string & path,
         }
     }
 
-    out.layers.resize(out.n_layer_phys);
     for (int i = 0; i < out.n_layer_phys; ++i) {
         auto & L = out.layers[i];
         L.is_swa = swa_pat[i];

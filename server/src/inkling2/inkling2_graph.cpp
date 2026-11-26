@@ -25,6 +25,15 @@
 namespace luce::common {
 namespace {
 
+static ggml_tensor * scale_expert_rows(ggml_context * c, ggml_tensor * rows,
+                                      ggml_tensor * scales, ggml_tensor * ids) {
+    if (!scales) return rows;
+    // One scale per original expert ID, broadcast across output channels.
+    ggml_tensor * table = ggml_reshape_3d(c, scales, 1, scales->ne[0], 1);
+    table = ggml_repeat_4d(c, table, 1, scales->ne[0], ids->ne[1], 1);
+    return ggml_mul(c, rows, ggml_get_rows(c, table, ids));
+}
+
 static constexpr size_t kInkling2PrefetchBytes = (size_t) 56 << 20;
 
 static ggml_tensor * row_view_2d(ggml_context * c, ggml_tensor * src, int64_t row_off, int64_t n_rows) {
@@ -634,10 +643,7 @@ static bool build_inkling2_target_graph(
                     c, cur, L.ffn_post_conv, state_live, state_dst, nullptr, ffn_inp, 2 * kv_sz + w.n_embd, 0, write_mode);
             }
         } else {
-            ggml_tensor * x3   = ggml_reshape_3d(c, cur, w.n_embd, 1, n_tokens);
-            ggml_tensor * gu   = ggml_mul_mat_id(c, L.ffn_gate_up_exps, x3, sel);
-            ggml_tensor * act  = ggml_inkling2_situ(c, gu, w.situ_beta, w.situ_linear_beta);
-            ggml_tensor * down = ggml_mul_mat_id(c, L.ffn_down_exps, act, sel);
+            ggml_tensor * down = inkling2_expert_down(c, L, cur, sel, w.situ_beta, w.situ_linear_beta);
             if (use_fused_moe_sconv) {
                 cur = inkling2_moe_masked_sum_sconv_add(
                     c, down, wsel, sel, nullptr,
@@ -755,6 +761,16 @@ static bool build_inkling2_target_graph(
 }
 
 } // namespace
+
+ggml_tensor * inkling2_expert_down(ggml_context * c, const Inkling2Layer & layer,
+                                 ggml_tensor * cur, ggml_tensor * ids, float beta, float linear_beta) {
+    ggml_tensor * x3 = ggml_reshape_3d(c, cur, cur->ne[0], 1, ids->ne[1]);
+    ggml_tensor * gate_up = ggml_mul_mat_id(c, layer.ffn_gate_up_exps, x3, ids);
+    gate_up = scale_expert_rows(c, gate_up, layer.ffn_gate_up_exps_scale, ids);
+    ggml_tensor * act = ggml_inkling2_situ(c, gate_up, beta, linear_beta);
+    ggml_tensor * down = ggml_mul_mat_id(c, layer.ffn_down_exps, act, ids);
+    return scale_expert_rows(c, down, layer.ffn_down_exps_scale, ids);
+}
 
 Inkling2ForwardOut inkling2_forward(
         ggml_backend_t target_backend,

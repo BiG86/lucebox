@@ -5,6 +5,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "inkling2/inkling2_graph.h"
 
 #include <algorithm>
 #include <cmath>
@@ -70,6 +71,67 @@ static bool test_situ(ggml_backend_t backend) {
     const float err = max_abs_diff(got, ref);
     std::printf("[test_inkling2_ops] situ max_abs_err=%.3e\n", err);
     return err < 1e-4f;
+}
+
+static bool test_expert_scales(ggml_backend_t backend, int T, bool scale_gate_up, bool scale_down) {
+    constexpr int E = 3, K = 2;
+    constexpr float beta = 4.0f, linear_beta = 25.0f;
+    const int32_t ids[] = {2, 0, 1, 2};
+    const float input[] = {1.0f, 0.0f, -0.5f, 0.0f};
+    const float gate_up[] = {2, 0, 0, 0, 3, 0, 0, 0,
+                             2, 0, 0, 0, 3, 0, 0, 0,
+                             2, 0, 0, 0, 3, 0, 0, 0};
+    const float down[] = {2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0};
+    const float gate_up_scales[] = {0.5f, 1.5f, 3.0f};
+    const float down_scales[] = {2.0f, 0.25f, 0.5f};
+
+    struct ggml_init_params gp = {64 * ggml_tensor_overhead() + ggml_graph_overhead() + 4096, nullptr, true};
+    ggml_context * ctx = ggml_init(gp);
+    ggml_tensor * t_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, T);
+    ggml_tensor * t_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, K, T);
+    luce::common::Inkling2Layer layer;
+    layer.ffn_gate_up_exps = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 4, E);
+    layer.ffn_down_exps = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, E);
+    if (scale_gate_up) layer.ffn_gate_up_exps_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, E);
+    if (scale_down) layer.ffn_down_exps_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, E);
+    ggml_tensor * out = luce::common::inkling2_expert_down(ctx, layer, t_input, t_ids, beta, linear_beta);
+    ggml_set_output(out);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    // Allocate all leaves, including any scale accidentally disconnected from the graph.
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_tensor_set(t_input, input, 0, 2 * T * sizeof(float));
+    ggml_backend_tensor_set(t_ids, ids, 0, K * T * sizeof(int32_t));
+    ggml_backend_tensor_set(layer.ffn_gate_up_exps, gate_up, 0, sizeof(gate_up));
+    ggml_backend_tensor_set(layer.ffn_down_exps, down, 0, sizeof(down));
+    if (scale_gate_up) ggml_backend_tensor_set(layer.ffn_gate_up_exps_scale, gate_up_scales, 0, sizeof(gate_up_scales));
+    if (scale_down) ggml_backend_tensor_set(layer.ffn_down_exps_scale, down_scales, 0, sizeof(down_scales));
+
+    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    float got[8] = {};
+    if (ok) ggml_backend_tensor_get(out, got, 0, 2 * K * T * sizeof(float));
+    for (int i = 0; i < K * T; ++i) {
+        const int e = ids[i];
+        const float x = input[2 * (i / K)] * (scale_gate_up ? gate_up_scales[e] : 1.0f);
+        const float g = 2.0f * x, u = 3.0f * x;
+        const float situ = beta * std::tanh(g / beta) / (1.0f + std::exp(-g)) *
+                           linear_beta * std::tanh(u / linear_beta);
+        const float expected = situ * 2.0f * (scale_down ? down_scales[e] : 1.0f);
+        if (!(std::fabs(got[2 * i] - expected) < 1e-4f && got[2 * i + 1] == 0.0f)) {
+            std::printf("[test_inkling2_ops] expert_scales T=%d gate_up=%d down=%d token=%d expert=%d got=[%.6f, %.6f] expected=[%.6f, 0]\n",
+                        T, scale_gate_up, scale_down, i / K, e, got[2 * i], got[2 * i + 1], expected);
+            ok = false;
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    std::printf("[test_inkling2_ops] expert_scales T=%d gate_up=%d down=%d %s\n",
+                T, scale_gate_up, scale_down, ok ? "PASS" : "FAIL");
+    return ok;
 }
 
 static bool test_sconv(ggml_backend_t backend) {
@@ -629,6 +691,11 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     ok &= test_situ(backend);
+    ok &= test_expert_scales(backend, 1, true, true);
+    ok &= test_expert_scales(backend, 2, true, true);
+    ok &= test_expert_scales(backend, 2, true, false);
+    ok &= test_expert_scales(backend, 2, false, true);
+    ok &= test_expert_scales(backend, 2, false, false);
     ok &= test_sconv(backend);
     ok &= test_attn_rel(backend, false, 1,  97);  // F16 decode T=1
     ok &= test_attn_rel(backend, true,  8,  97);  // Q8_0 verify T=8

@@ -10,6 +10,10 @@
 
 namespace luce::common {
 
+// Compute uncombined expert outputs for routes indexed by original GGUF expert ID.
+ggml_tensor * inkling2_expert_down(ggml_context * c, const Inkling2Layer & layer,
+                                 ggml_tensor * cur, ggml_tensor * ids, float beta, float linear_beta);
+
 struct Inkling2ForwardOut {
     bool ok = false;
     std::vector<int32_t> greedy; // size = T (or 1 for prefill)
