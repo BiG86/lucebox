@@ -13,6 +13,7 @@
 
 #include "inkling2_graph.h"
 
+#include "common/cuda_graph_overrides.h"
 #include "ggml-cuda.h"
 
 #include <algorithm>
@@ -843,6 +844,10 @@ Inkling2ForwardOut inkling2_forward(
             ggml_backend_sched_synchronize(ws->sched);
         }
     } else {
+        // Keep the monolithic verify columns on the same arithmetic as AR.
+        const bool invariant_verify = verify && n_tokens >= 2 && n_tokens <= 8 &&
+                                      !use_split && !use_split_kv && !w.expert_backend;
+        const ScopedCudaGraphOverrides invariant(false, 0, false, 0, invariant_verify);
         st = ggml_backend_graph_compute(target_backend, ws->gf);
     }
     if (st != GGML_STATUS_SUCCESS) {
