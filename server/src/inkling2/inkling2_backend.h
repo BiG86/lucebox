@@ -21,6 +21,7 @@
 #include "inkling2_graph.h"
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -59,6 +60,11 @@ struct Inkling2Snapshot {
     std::vector<float>    logits;
 };
 
+struct Inkling2ArTiming {
+    std::chrono::steady_clock::time_point first{};
+    std::chrono::steady_clock::time_point last{};
+};
+
 class Inkling2Backend final : public ModelBackend {
 public:
     explicit Inkling2Backend(Inkling2BackendConfig cfg);
@@ -85,6 +91,11 @@ public:
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
 
+    // Cold, forced AR diagnostic. On success, time accepted tokens before emission;
+    // a request with fewer than two accepted tokens has no nonzero window.
+    GenerateResult generate_with_ar_timing(const GenerateRequest & req,
+                                           const DaemonIO & io, Inkling2ArTiming & timing);
+
     bool snapshot_save(int slot) override;
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
@@ -107,7 +118,10 @@ public:
     void shutdown() override;
 
 private:
-    GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored);
+    GenerateResult generate_cold(const GenerateRequest & req, const DaemonIO & io,
+                                 Inkling2ArTiming * timing);
+    GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored,
+                       Inkling2ArTiming * timing = nullptr);
     size_t pflash_reserve(ggml_backend_t device, int ctx) const;
     bool load_all();
     void release_device_state();

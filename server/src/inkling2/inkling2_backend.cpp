@@ -503,14 +503,28 @@ GenerateResult Inkling2Backend::restore_and_generate_impl(int slot,
 }
 
 GenerateResult Inkling2Backend::generate_impl(const GenerateRequest & req,
-                                              const DaemonIO & io) {
+                                             const DaemonIO & io) {
+    return generate_cold(req, io, nullptr);
+}
+
+GenerateResult Inkling2Backend::generate_with_ar_timing(const GenerateRequest & req,
+                                                        const DaemonIO & io, Inkling2ArTiming & timing) {
+    GenerateRequest ar = req;
+    ar.force_ar_decode = true;
+    timing = {};
+    return generate_cold(ar, io, &timing);
+}
+
+GenerateResult Inkling2Backend::generate_cold(const GenerateRequest & req, const DaemonIO & io,
+                                              Inkling2ArTiming * timing) {
     last_logits_.clear();
     if (!parked_ && !released_) reset_inkling2_cache(cache_);
-    return run(req, io, 0);
+    return run(req, io, 0, timing);
 }
 
 // ─── Prefill + DSpark Speculative Decode Loop ───────────────────────────
-GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO & raw_io, int restored) {
+GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO & raw_io, int restored,
+                                    Inkling2ArTiming * timing) {
     GenerateResult result;
     result.restored_prefix_tokens = restored;
     const DaemonIO io = raw_io.with_token_callback(req.on_token);
@@ -726,6 +740,10 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
         result.budget_forced_close = budget.forced_close();
         result.tokens.push_back(tok);
         history.push_back(tok);
+        if (timing) {
+            timing->last = std::chrono::steady_clock::now();
+            if (result.tokens.size() == 1) timing->first = timing->last;
+        }
         io.emit(tok);
         if (io.is_cancelled()) {
             cancelled = true;
