@@ -78,6 +78,8 @@ struct Inkling2Layer {
     ggml_tensor * ffn_exp_probs_b  = nullptr; // [n_expert] F32 (optional)
     ggml_tensor * ffn_gate_up_exps = nullptr; // [n_embd, 2*n_ff_exp, n_expert] IQ4_NL/Q8_0 (on target)
     ggml_tensor * ffn_down_exps    = nullptr; // [n_ff_exp, n_embd, n_expert] IQ4_NL/Q8_0 (on target)
+    ggml_tensor * ffn_gate_up_exps_scale = nullptr; // Optional F32[n_expert]
+    ggml_tensor * ffn_down_exps_scale    = nullptr; // Optional F32[n_expert]
 
     // Dual-GPU split mode: tail experts [split_exp .. n_expert-1] on expert_backend (Strix Halo)
     ggml_tensor * exp_gate_up_tail = nullptr; // [n_embd, 2*n_ff_exp, n_exp_tail] on expert_backend
