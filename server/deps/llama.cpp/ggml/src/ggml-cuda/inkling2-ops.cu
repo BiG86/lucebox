@@ -3,6 +3,8 @@
 // shapes and pool allocations, making every op 100% HIP-graph / CUDA-graph safe.
 
 #include "inkling2-ops.cuh"
+#include "inkling2-attn-plan.h"
+#include "inkling2-softmax.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,6 +20,12 @@ static constexpr float kLn2        = 0.69314718055994530942f;
 static __device__ __forceinline__ float sigmoid_f32(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
+
+// Exponential functor handed to inkling2_softmax::online_softmax_pair; keeps
+// the shared header free of CUDA/HIP declarations.
+struct inkling2_expf {
+    __device__ __forceinline__ float operator()(float x) const { return expf(x); }
+};
 
 static __device__ __forceinline__ float round_bf16_f32(float x) {
     uint32_t bits = __float_as_uint(x);
@@ -1056,8 +1064,11 @@ static __global__ void inkling2_attn_rel_split_kernel(
             const float score = dot + rt_base[g][dist];
 
             const float m_new = fmaxf(m_max[g], score);
-            const float alpha = isinf(m_max[g]) ? 0.0f : expf(m_max[g] - m_new);
-            const float p     = expf(score - m_new);
+            // One exp per (key, head): with m_new = max(m_max, score) the other
+            // factor is exp(0) == 1 exactly, and alpha/p stay bit-identical.
+            // Evidence: lucebox/benchmarks/inkling2-q8-single-exp.md (b50200a).
+            float alpha, p;
+            inkling2_softmax::online_softmax_pair(m_max[g], score, inkling2_expf{}, alpha, p);
             l_sum[g] = l_sum[g] * alpha + p;
             o_acc[g][0] = o_acc[g][0] * alpha + p * vv[0];
             o_acc[g][1] = o_acc[g][1] * alpha + p * vv[1];
@@ -3772,8 +3783,8 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 }
             } else {
                 // Global layers: Split-KV FlashDecoding (HIP-graph invariant across 128K-262K context!)
-                const int num_splits = (T <= 2 ? 16 : (T <= 8 ? 8 : 4));
-                ggml_cuda_pool_alloc<float> part_buf(ctx.pool(), (size_t) num_splits * T * Hq * 130);
+                const int num_splits = inkling2_attn_plan::global_split_count(T);
+                ggml_cuda_pool_alloc<float> part_buf(ctx.pool(), inkling2_attn_plan::partial_buffer_elems(T, Hq, num_splits));
                 dim3 grid(Hk, T, num_splits);
                 dim3 block(WARP_SIZE, 4, 1);
                 if (is_q8) {
