@@ -7,6 +7,7 @@
 #include "ggml-cuda.h"
 #include "inkling2/inkling2_graph.h"
 #include "inkling2-attn-plan.h"
+#include "inkling2-softmax.h"
 
 #include <algorithm>
 #include <cmath>
@@ -727,6 +728,73 @@ static bool test_global_attn_split_plan() {
     return ok;
 }
 
+static bool test_online_softmax_single_exp() {
+    // Pins the one-exp online-softmax update of the global split-KV attention.
+    // With m_new = max(m_prev, score) exactly one of exp(m_prev - m_new) and
+    // exp(score - m_new) is exp(0) == 1.0f, so the shared helper must call the
+    // exponential once per (key, head) and stay bit-identical to the two-exp
+    // reference. Evidence: lucebox/benchmarks/inkling2-q8-single-exp.md
+    // (b50200a): -21.05% per layer at 65.514 keys, same FP64 max error.
+    struct CountingExp {
+        int * calls;
+        float operator()(float x) const { ++*calls; return std::exp(x); }
+    };
+    const auto same_bits = [](float a, float b) {
+        return std::memcmp(&a, &b, sizeof(float)) == 0;
+    };
+
+    int mismatches = 0, call_mismatches = 0, not_one = 0, cases = 0;
+    const auto check = [&](float m_prev, float score) {
+        CountingExp fn;
+        int exp_calls = 0;
+        fn.calls = &exp_calls;
+        float alpha = 0.0f, p = 0.0f;
+        inkling2_softmax::online_softmax_pair(m_prev, score, fn, alpha, p);
+
+        const float m_new = std::fmax(m_prev, score);
+        const float ref_alpha = std::isinf(m_prev) ? 0.0f : std::exp(m_prev - m_new);
+        const float ref_p = std::exp(score - m_new);
+        if (!same_bits(alpha, ref_alpha) || !same_bits(p, ref_p)) {
+            std::printf("[test_inkling2_ops] online_softmax mismatch m_prev=%.9g score=%.9g: "
+                        "alpha=%.9g/%.9g p=%.9g/%.9g\n", m_prev, score, alpha, ref_alpha, p, ref_p);
+            ++mismatches;
+        }
+        // One exp for the whole update, not two.
+        if (exp_calls != 1) {
+            ++call_mismatches;
+        }
+        // Exactly one of the two factors is exp(0) == 1 for any finite pair
+        // (also when m_prev is still -inf).
+        if ((!std::isinf(m_prev) || m_prev < 0.0f) && alpha != 1.0f && p != 1.0f) {
+            ++not_one;
+        }
+        ++cases;
+    };
+
+    // Directed corners: first key (m_prev == -inf) and the two branches.
+    check(-INFINITY, 0.5f);   // exp(-inf) == 0 reproduces the old isinf guard
+    check(0.5f, -INFINITY);
+    check(INFINITY, 0.5f);
+    check(0.5f, 3.0f);        // score raised
+    check(3.0f, 0.5f);        // score below max
+    check(0.5f, 0.5f);        // equal
+    check(0.0f, -0.0f);
+    check(1000.0f, -1000.0f);
+
+    std::mt19937 rng(20261128);
+    std::uniform_real_distribution<float> wide(-120.0f, 120.0f);
+    std::uniform_real_distribution<float> small(-2.0f, 2.0f);
+    for (int i = 0; i < 200000; ++i) {
+        check(i & 1 ? wide(rng) : small(rng), i & 2 ? wide(rng) : small(rng));
+    }
+
+    const bool ok = mismatches == 0 && call_mismatches == 0 && not_one == 0;
+    std::printf("[test_inkling2_ops] online_softmax_single_exp %s "
+                "(cases=%d exp_mismatch=%d alpha_p_mismatch=%d not_one=%d)\n",
+                ok ? "PASS" : "FAIL", cases, call_mismatches, mismatches, not_one);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -735,6 +803,7 @@ int main(int argc, char ** argv) {
     if (argc > 1) gpu = std::atoi(argv[1]);
 
     bool ok = test_global_attn_split_plan();
+    ok &= test_online_softmax_single_exp();
 
     ggml_backend_t backend = ggml_backend_cuda_init(gpu);
     if (!backend) {
