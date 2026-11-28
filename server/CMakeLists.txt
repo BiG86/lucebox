@@ -2341,7 +2341,9 @@ if(LUCE_TESTS)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_inkling2_ops.cpp")
         add_executable(test_inkling2_ops test/unit/test_inkling2_ops.cpp)
-        target_include_directories(test_inkling2_ops PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        # The global-attention launch plan lives next to the kernel it sizes.
+        target_include_directories(test_inkling2_ops PRIVATE ${LUCE_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         target_link_libraries(test_inkling2_ops PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
         add_test(NAME inkling2_ops COMMAND test_inkling2_ops)
         set_tests_properties(inkling2_ops PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
