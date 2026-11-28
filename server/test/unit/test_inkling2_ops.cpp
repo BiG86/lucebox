@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "inkling2/inkling2_graph.h"
+#include "inkling2-attn-plan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -676,6 +677,56 @@ static bool test_sconv_kv_write_and_clip_r(ggml_backend_t backend) {
     return kv_err < 1e-4f && rt_err < 1e-5f;
 }
 
+static bool test_global_attn_split_plan() {
+    // Pins the host-side plan of the global split-KV verify attention:
+    //   - 16 KV splits for every verify width up to 8 (the DSpark block T == 8
+    //     and the short tails at 6 and 2 that the fixtures exercise),
+    //   - 4 splits above that,
+    //   - a partial-buffer footprint that follows the launched split count
+    //     (a fixed 8 would overflow once the launch uses 16).
+    // Evidence: lucebox/benchmarks/inkling2-q8-splits16.md (eb28ccd),
+    // ...-e2e.md (8c52c64), isolation 7d6fddd.
+    using namespace inkling2_attn_plan;
+    constexpr int Hq = 24;
+    constexpr int kNarrowSplits = 16;
+    constexpr int kWideSplits = 4;
+    bool ok = true;
+
+    for (int T = 1; T <= 8; ++T) {
+        const int splits = global_split_count(T);
+        const std::size_t got = partial_buffer_elems(T, Hq, splits);
+        const std::size_t want = (std::size_t) kNarrowSplits * T * Hq * kPartialStride;
+        if (splits != kNarrowSplits || got != want) {
+            std::printf("[test_inkling2_ops] global_split_plan T=%d splits=%d (want %d) "
+                        "part_elems=%zu (want %zu)\n", T, splits, kNarrowSplits, got, want);
+            ok = false;
+        }
+    }
+    for (int T : {9, 16, 32, 64}) {
+        const int splits = global_split_count(T);
+        const std::size_t got = partial_buffer_elems(T, Hq, splits);
+        const std::size_t want = (std::size_t) kWideSplits * T * Hq * kPartialStride;
+        if (splits != kWideSplits || got != want) {
+            std::printf("[test_inkling2_ops] global_split_plan T=%d splits=%d (want %d) "
+                        "part_elems=%zu (want %zu)\n", T, splits, kWideSplits, got, want);
+            ok = false;
+        }
+    }
+    // Regression guard for the silent overflow: at T == 8 the plan must ask for
+    // more than an 8-split buffer.
+    const std::size_t t8 = partial_buffer_elems(8, Hq, global_split_count(8));
+    const std::size_t eight_splits = (std::size_t) 8 * 8 * Hq * kPartialStride;
+    if (!(t8 > eight_splits)) {
+        std::printf("[test_inkling2_ops] global_split_plan T=8 footprint %zu not above "
+                    "the fixed 8-split %zu\n", t8, eight_splits);
+        ok = false;
+    }
+    std::printf("[test_inkling2_ops] global_split_plan %s (T<=8 -> %d splits, T=9 -> %d, "
+                "T=8 footprint %zu floats)\n", ok ? "PASS" : "FAIL",
+                global_split_count(8), global_split_count(9), t8);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -683,13 +734,14 @@ int main(int argc, char ** argv) {
     if (const char * e = std::getenv("LUCE_TEST_GPU")) gpu = std::atoi(e);
     if (argc > 1) gpu = std::atoi(argv[1]);
 
+    bool ok = test_global_attn_split_plan();
+
     ggml_backend_t backend = ggml_backend_cuda_init(gpu);
     if (!backend) {
         std::fprintf(stderr, "[test_inkling2_ops] no GPU %d available, skipping\n", gpu);
         return 77;
     }
 
-    bool ok = true;
     ok &= test_situ(backend);
     ok &= test_expert_scales(backend, 1, true, true);
     ok &= test_expert_scales(backend, 2, true, true);

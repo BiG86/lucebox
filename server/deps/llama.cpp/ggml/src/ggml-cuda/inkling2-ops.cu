@@ -3,6 +3,7 @@
 // shapes and pool allocations, making every op 100% HIP-graph / CUDA-graph safe.
 
 #include "inkling2-ops.cuh"
+#include "inkling2-attn-plan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -3772,8 +3773,8 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 }
             } else {
                 // Global layers: Split-KV FlashDecoding (HIP-graph invariant across 128K-262K context!)
-                const int num_splits = (T <= 2 ? 16 : (T <= 8 ? 8 : 4));
-                ggml_cuda_pool_alloc<float> part_buf(ctx.pool(), (size_t) num_splits * T * Hq * 130);
+                const int num_splits = inkling2_attn_plan::global_split_count(T);
+                ggml_cuda_pool_alloc<float> part_buf(ctx.pool(), inkling2_attn_plan::partial_buffer_elems(T, Hq, num_splits));
                 dim3 grid(Hk, T, num_splits);
                 dim3 block(WARP_SIZE, 4, 1);
                 if (is_q8) {
